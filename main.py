@@ -33,25 +33,35 @@ app.add_middleware(
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: Dict[int, List[WebSocket]] = {}
+        self.active_connections: Dict[int, List[WebSocket]] = {} 
+        self.plates_connections: List[WebSocket] = [] 
 
-    async def connect(self, websocket: WebSocket, plate_id: int):
+    async def connect(self, websocket: WebSocket, plate_id: int = None):
         await websocket.accept()
-        if plate_id not in self.active_connections:
-            self.active_connections[plate_id] = []
-        self.active_connections[plate_id].append(websocket)
+        if plate_id is not None:
+            if plate_id not in self.active_connections:
+                self.active_connections[plate_id] = []
+            self.active_connections[plate_id].append(websocket)
+        else:
+            self.plates_connections.append(websocket)
 
-    def disconnect(self, websocket: WebSocket, plate_id: int):
-        if plate_id in self.active_connections and websocket in self.active_connections[plate_id]:
-            self.active_connections[plate_id].remove(websocket)
-            if not self.active_connections[plate_id]:
-                del self.active_connections[plate_id]
+    def disconnect(self, websocket: WebSocket, plate_id: int = None):
+        if plate_id is not None:
+            if plate_id in self.active_connections and websocket in self.active_connections[plate_id]:
+                self.active_connections[plate_id].remove(websocket)
+                if not self.active_connections[plate_id]:
+                    del self.active_connections[plate_id]
+        else:
+            if websocket in self.plates_connections:
+                self.plates_connections.remove(websocket)
 
-    async def broadcast(self, message: dict, plate_id: int):
-        if plate_id in self.active_connections:
+    async def broadcast(self, message: dict, plate_id: int = None):
+        if plate_id is not None and plate_id in self.active_connections:
             for connection in self.active_connections[plate_id]:
                 await connection.send_json(message)
-
+        elif plate_id is None:
+            for connection in self.plates_connections:
+                await connection.send_json(message)
 manager = ConnectionManager()
 @app.post("/login/", response_model=Token)
 async def login_for_access_token(
@@ -86,9 +96,40 @@ async def websocket_endpoint(websocket: WebSocket, plate_id: int, db: Session = 
         })
 
         while True:
-            await websocket.receive_text()  
+            await websocket.receive_text()  # Bu yerda faqat yangilanishlarni eshitish uchun qoldiramiz
     except WebSocketDisconnect:
         manager.disconnect(websocket, plate_id)
+@app.websocket("/ws/plates/")
+async def plates_websocket(websocket: WebSocket, db: Session = Depends(get_db)):
+    await websocket.accept()
+    try:
+        # Dastlabki plitalar ro‘yxatini yuborish
+        plates = db.query(AutoPlate).filter(AutoPlate.is_active == True).all()
+        highest_bids = db.query(Bid.plate_id, func.max(Bid.amount).label("highest_bid")).group_by(Bid.plate_id).all()
+        highest_bid_dict = {plate_id: amount for plate_id, amount in highest_bids}
+        
+        plate_list = [
+            {
+                "id": plate.id,
+                "plate_number": plate.plate_number,
+                "description": plate.description,
+                "deadline": plate.deadline.isoformat(),
+                "is_active": plate.is_active,
+                "highest_bid": highest_bid_dict.get(plate.id, 0)
+            }
+            for plate in plates
+        ]
+        
+        await websocket.send_json({
+            "type": "initial_plates",
+            "plates": plate_list
+        })
+
+        # Doimiy eshitish (yangilanishlarni kutish uchun)
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
 @app.post("/users/", response_model=UserSchema)
 async def create_user(user: UserCreate, db: Session = Depends(get_db)):
     db_user = db.query(User).filter(User.username == user.username).first()
@@ -160,12 +201,10 @@ async def create_plate(
     current_user: User = Depends(get_current_active_staff_user),
     db: Session = Depends(get_db)
 ):
-    # Check if plate number already exists
     existing_plate = db.query(AutoPlate).filter(AutoPlate.plate_number == plate.plate_number).first()
     if existing_plate:
         raise HTTPException(status_code=400, detail="Plate number already exists")
     
-    # Check if deadline is in the future
     if plate.deadline <= datetime.utcnow():
         raise HTTPException(status_code=400, detail="Deadline must be in the future")
     
@@ -178,7 +217,87 @@ async def create_plate(
     db.add(db_plate)
     db.commit()
     db.refresh(db_plate)
+
+    # WebSocket orqali yangi plita haqida xabar yuborish
+    await manager.broadcast({
+        "type": "plate_created",
+        "plate": {
+            "id": db_plate.id,
+            "plate_number": db_plate.plate_number,
+            "description": db_plate.description,
+            "deadline": db_plate.deadline.isoformat(),
+            "is_active": db_plate.is_active,
+            "highest_bid": 0
+        }
+    }, plate_id=None)  # Umumiy plitalar uchun plate_id=None ishlatamiz
+
     return db_plate
+
+@app.put("/plates/{plate_id}/", response_model=AutoPlateDetail)
+async def update_plate(
+    plate_id: int,
+    plate_update: AutoPlateUpdate,
+    current_user: User = Depends(get_current_active_staff_user),
+    db: Session = Depends(get_db)
+):
+    db_plate = db.query(AutoPlate).filter(AutoPlate.id == plate_id).first()
+    if not db_plate:
+        raise HTTPException(status_code=404, detail="Plate not found")
+    
+    if plate_update.deadline <= datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Deadline must be in the future")
+    
+    if plate_update.plate_number != db_plate.plate_number:
+        existing_plate = db.query(AutoPlate).filter(AutoPlate.plate_number == plate_update.plate_number).first()
+        if existing_plate:
+            raise HTTPException(status_code=400, detail="Plate number already exists")
+    
+    db_plate.plate_number = plate_update.plate_number
+    db_plate.description = plate_update.description
+    db_plate.deadline = plate_update.deadline
+    
+    db.commit()
+    db.refresh(db_plate)
+
+    # WebSocket orqali yangilangan plita haqida xabar yuborish
+    await manager.broadcast({
+        "type": "plate_updated",
+        "plate": {
+            "id": db_plate.id,
+            "plate_number": db_plate.plate_number,
+            "description": db_plate.description,
+            "deadline": db_plate.deadline.isoformat(),
+            "is_active": db_plate.is_active,
+            "highest_bid": db.query(func.max(Bid.amount)).filter(Bid.plate_id == plate_id).scalar() or 0
+        }
+    }, plate_id=None)
+
+    return db_plate
+
+@app.delete("/plates/{plate_id}/", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_plate(
+    plate_id: int,
+    current_user: User = Depends(get_current_active_staff_user),
+    db: Session = Depends(get_db)
+):
+    db_plate = db.query(AutoPlate).filter(AutoPlate.id == plate_id).first()
+    if not db_plate:
+        raise HTTPException(status_code=404, detail="Plate not found")
+    
+    bids_count = db.query(Bid).filter(Bid.plate_id == plate_id).count()
+    if bids_count > 0:
+        raise HTTPException(status_code=400, detail="Cannot delete plate with active bids")
+    
+    db.delete(db_plate)
+    db.commit()
+
+    # WebSocket orqali o‘chirilgan plita haqida xabar yuborish
+    await manager.broadcast({
+        "type": "plate_deleted",
+        "plate_id": plate_id
+    }, plate_id=None)
+
+    return None
 
 @app.get("/plates/{plate_id}/", response_model=AutoPlateDetail)
 async def get_plate(plate_id: int, db: Session = Depends(get_db)):
@@ -201,7 +320,6 @@ async def get_plate(plate_id: int, db: Session = Depends(get_db)):
     }
     
     return plate_dict
-
 @app.put("/plates/{plate_id}/", response_model=AutoPlateDetail)
 async def update_plate(
     plate_id: int,
@@ -213,15 +331,11 @@ async def update_plate(
     if not db_plate:
         raise HTTPException(status_code=404, detail="Plate not found")
     
-    # Check if deadline is in the future
     if plate_update.deadline <= datetime.utcnow():
         raise HTTPException(status_code=400, detail="Deadline must be in the future")
     
-    # Check if plate number already exists (if changing)
     if plate_update.plate_number != db_plate.plate_number:
-        existing_plate = db.query(AutoPlate).filter(
-            AutoPlate.plate_number == plate_update.plate_number
-        ).first()
+        existing_plate = db.query(AutoPlate).filter(AutoPlate.plate_number == plate_update.plate_number).first()
         if existing_plate:
             raise HTTPException(status_code=400, detail="Plate number already exists")
     
@@ -231,8 +345,21 @@ async def update_plate(
     
     db.commit()
     db.refresh(db_plate)
-    return db_plate
 
+    # WebSocket orqali yangilangan plita haqida xabar yuborish
+    await manager.broadcast({
+        "type": "plate_updated",
+        "plate": {
+            "id": db_plate.id,
+            "plate_number": db_plate.plate_number,
+            "description": db_plate.description,
+            "deadline": db_plate.deadline.isoformat(),
+            "is_active": db_plate.is_active,
+            "highest_bid": db.query(func.max(Bid.amount)).filter(Bid.plate_id == plate_id).scalar() or 0
+        }
+    }, plate_id=None)
+
+    return db_plate
 @app.delete("/plates/{plate_id}/", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_plate(
     plate_id: int,
@@ -243,13 +370,19 @@ async def delete_plate(
     if not db_plate:
         raise HTTPException(status_code=404, detail="Plate not found")
     
-    # Check if plate has bids
     bids_count = db.query(Bid).filter(Bid.plate_id == plate_id).count()
     if bids_count > 0:
         raise HTTPException(status_code=400, detail="Cannot delete plate with active bids")
     
     db.delete(db_plate)
     db.commit()
+
+    # WebSocket orqali o‘chirilgan plita haqida xabar yuborish
+    await manager.broadcast({
+        "type": "plate_deleted",
+        "plate_id": plate_id
+    }, plate_id=None)
+
     return None
 
 # Bid Endpoints
