@@ -1,9 +1,9 @@
 # main.py
-from fastapi import FastAPI, Depends, HTTPException, status, Query
+from fastapi import FastAPI, Depends, HTTPException, status, Query,WebSocket, WebSocketDisconnect
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
-from typing import List, Optional
+from typing import List, Optional,Dict
 from datetime import datetime, timedelta
 import uvicorn
 from auth import *
@@ -17,6 +17,7 @@ from schemas import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from auth import *
+import json
 
 Base.metadata.create_all(bind=engine)
 
@@ -29,7 +30,29 @@ app.add_middleware(
     allow_methods=["*"],  
     allow_headers=["*"],  
 )
-# Authentication Endpoint
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[int, List[WebSocket]] = {}
+
+    async def connect(self, websocket: WebSocket, plate_id: int):
+        await websocket.accept()
+        if plate_id not in self.active_connections:
+            self.active_connections[plate_id] = []
+        self.active_connections[plate_id].append(websocket)
+
+    def disconnect(self, websocket: WebSocket, plate_id: int):
+        if plate_id in self.active_connections and websocket in self.active_connections[plate_id]:
+            self.active_connections[plate_id].remove(websocket)
+            if not self.active_connections[plate_id]:
+                del self.active_connections[plate_id]
+
+    async def broadcast(self, message: dict, plate_id: int):
+        if plate_id in self.active_connections:
+            for connection in self.active_connections[plate_id]:
+                await connection.send_json(message)
+
+manager = ConnectionManager()
 @app.post("/login/", response_model=Token)
 async def login_for_access_token(
     form_data: OAuth2PasswordRequestForm = Depends(),
@@ -48,7 +71,24 @@ async def login_for_access_token(
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
-# User Registration Endpoint
+@app.websocket("/ws/bids/{plate_id}/")
+async def websocket_endpoint(websocket: WebSocket, plate_id: int, db: Session = Depends(get_db)):
+    await manager.connect(websocket, plate_id)
+    try:
+        highest_bid = db.query(func.max(Bid.amount)).filter(Bid.plate_id == plate_id).scalar() or 0
+        bids = db.query(Bid).filter(Bid.plate_id == plate_id).order_by(Bid.created_at.desc()).all()
+        bid_list = [{"id": bid.id, "amount": bid.amount, "user_id": bid.user_id, "created_at": bid.created_at.isoformat()} for bid in bids]
+        
+        await websocket.send_json({
+            "type": "initial",
+            "highest_bid": highest_bid,
+            "bids": bid_list
+        })
+
+        while True:
+            await websocket.receive_text()  
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, plate_id)
 @app.post("/users/", response_model=UserSchema)
 async def create_user(user: UserCreate, db: Session = Depends(get_db)):
     db_user = db.query(User).filter(User.username == user.username).first()
@@ -227,7 +267,6 @@ async def create_bid(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    # Check if plate exists and is active
     plate = db.query(AutoPlate).filter(AutoPlate.id == bid.plate_id).first()
     if not plate:
         raise HTTPException(status_code=404, detail="Plate not found")
@@ -235,27 +274,22 @@ async def create_bid(
     if not plate.is_active:
         raise HTTPException(status_code=400, detail="Bidding is closed")
     
-    # Check if deadline has passed
     if plate.deadline < datetime.utcnow():
         raise HTTPException(status_code=400, detail="Bidding period has ended")
     
-    # Check if bid amount is positive
     if bid.amount <= 0:
         raise HTTPException(status_code=400, detail="Bid amount must be positive")
-    
-    # Get the highest bid and the user who placed it
-    last_bid = db.query(Bid).filter(Bid.plate_id == bid.plate_id).order_by(Bid.amount.desc()).first()
-    
-    # Agar eng oxirgi taklifni aynan shu foydalanuvchi kiritgan bo'lsa, unga yangi narx qo'yish taqiqlanadi
+
+    highest_bid = db.query(func.max(Bid.amount)).filter(Bid.plate_id == bid.plate_id).scalar() or 0
+
+    last_bid = db.query(Bid).filter(Bid.plate_id == bid.plate_id).order_by(Bid.created_at.desc()).first()
+
     if last_bid and last_bid.user_id == current_user.id:
-        raise HTTPException(status_code=400, detail="You must wait for another user to place a bid before bidding again")
-    
-    # Check if bid exceeds current highest bid
-    highest_bid = last_bid.amount if last_bid else 0
+        raise HTTPException(status_code=400, detail="Siz yangi bid qo‘yish uchun boshqa foydalanuvchi bid berishini kutishingiz kerak")
+
     if bid.amount <= highest_bid:
         raise HTTPException(status_code=400, detail="Bid must exceed current highest bid")
-    
-    # Create bid
+
     db_bid = Bid(
         amount=bid.amount,
         user_id=current_user.id,
@@ -264,6 +298,19 @@ async def create_bid(
     db.add(db_bid)
     db.commit()
     db.refresh(db_bid)
+
+    # WebSocket orqali yangi bidni barcha ulangan clientlarga yuborish
+    await manager.broadcast({
+        "type": "new_bid",
+        "bid": {
+            "id": db_bid.id,
+            "amount": db_bid.amount,
+            "user_id": db_bid.user_id,
+            "created_at": db_bid.created_at.isoformat()
+        },
+        "highest_bid": db_bid.amount
+    }, bid.plate_id)
+
     return db_bid
 
 @app.get("/bids/{bid_id}/", response_model=BidDetail)
@@ -328,25 +375,32 @@ async def delete_bid(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    # Check if bid exists
     bid = db.query(Bid).filter(Bid.id == bid_id).first()
     if not bid:
         raise HTTPException(status_code=404, detail="Bid not found")
     
-    # Check if user is the bid owner
     if bid.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not authorized to delete this bid")
     
-    # Check if plate exists and is active
     plate = db.query(AutoPlate).filter(AutoPlate.id == bid.plate_id).first()
     if not plate:
         raise HTTPException(status_code=404, detail="Associated plate not found")
     
-    # Check if deadline has passed
     if plate.deadline < datetime.utcnow():
         raise HTTPException(status_code=403, detail="Bidding period has ended")
     
-    # Delete bid
+    # Bidni o'chirish
     db.delete(bid)
     db.commit()
+
+    # Yangi eng yuqori bidni hisoblash
+    new_highest_bid = db.query(func.max(Bid.amount)).filter(Bid.plate_id == plate.id).scalar() or 0
+    
+    # WebSocket orqali o'chirilgan bid haqida xabar yuborish
+    await manager.broadcast({
+        "type": "bid_deleted",
+        "bid_id": bid_id,
+        "new_highest_bid": new_highest_bid
+    }, plate.id)
+
     return None
