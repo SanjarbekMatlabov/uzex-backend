@@ -389,14 +389,11 @@ async def delete_bid(
     if plate.deadline < datetime.utcnow():
         raise HTTPException(status_code=403, detail="Bidding period has ended")
     
-    # Bidni o'chirish
     db.delete(bid)
     db.commit()
 
-    # Yangi eng yuqori bidni hisoblash
     new_highest_bid = db.query(func.max(Bid.amount)).filter(Bid.plate_id == plate.id).scalar() or 0
     
-    # WebSocket orqali o'chirilgan bid haqida xabar yuborish
     await manager.broadcast({
         "type": "bid_deleted",
         "bid_id": bid_id,
