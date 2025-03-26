@@ -59,51 +59,49 @@ class ConnectionManager:
         if plate_id is not None and plate_id in self.active_connections:
             for connection in self.active_connections[plate_id]:
                 await connection.send_json(message)
+        
+        # Always broadcast plate updates to general plates websocket
+        if plate_id is not None:
+            for connection in self.plates_connections:
+                await connection.send_json(message)
         elif plate_id is None:
             for connection in self.plates_connections:
                 await connection.send_json(message)
 manager = ConnectionManager()
-@app.post("/login/", response_model=Token)
-async def login_for_access_token(
-    form_data: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db)
-):
-    user = authenticate_user(db, form_data.username, form_data.password)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.username}, expires_delta=access_token_expires
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
+
 
 @app.websocket("/ws/bids/{plate_id}/")
-async def websocket_endpoint(websocket: WebSocket, plate_id: int, db: Session = Depends(get_db)):
+async def websocket_bid_endpoint(websocket: WebSocket, plate_id: int, db: Session = Depends(get_db)):
     await manager.connect(websocket, plate_id)
     try:
+        # Initially send current bid information
         highest_bid = db.query(func.max(Bid.amount)).filter(Bid.plate_id == plate_id).scalar() or 0
         bids = db.query(Bid).filter(Bid.plate_id == plate_id).order_by(Bid.created_at.desc()).all()
-        bid_list = [{"id": bid.id, "amount": bid.amount, "user_id": bid.user_id, "created_at": bid.created_at.isoformat()} for bid in bids]
+        bid_list = [
+            {
+                "id": bid.id, 
+                "amount": bid.amount, 
+                "user_id": bid.user_id, 
+                "created_at": bid.created_at.isoformat()
+            } for bid in bids
+        ]
         
         await websocket.send_json({
-            "type": "initial",
+            "type": "initial_bids",
             "highest_bid": highest_bid,
             "bids": bid_list
         })
 
         while True:
-            await websocket.receive_text()  # Bu yerda faqat yangilanishlarni eshitish uchun qoldiramiz
+            data = await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket, plate_id)
+
 @app.websocket("/ws/plates/")
 async def plates_websocket(websocket: WebSocket, db: Session = Depends(get_db)):
-    await websocket.accept()
+    await manager.connect(websocket)
     try:
-        # Dastlabki plitalar ro‘yxatini yuborish
+        # Send initial plates data with highest bids
         plates = db.query(AutoPlate).filter(AutoPlate.is_active == True).all()
         highest_bids = db.query(Bid.plate_id, func.max(Bid.amount).label("highest_bid")).group_by(Bid.plate_id).all()
         highest_bid_dict = {plate_id: amount for plate_id, amount in highest_bids}
@@ -125,11 +123,27 @@ async def plates_websocket(websocket: WebSocket, db: Session = Depends(get_db)):
             "plates": plate_list
         })
 
-        # Doimiy eshitish (yangilanishlarni kutish uchun)
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        pass
+        manager.disconnect(websocket)
+@app.post("/login/", response_model=Token)
+async def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
 @app.post("/users/", response_model=UserSchema)
 async def create_user(user: UserCreate, db: Session = Depends(get_db)):
     db_user = db.query(User).filter(User.username == user.username).first()
