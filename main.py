@@ -498,6 +498,32 @@ async def create_bid(
     db.add(db_bid)
     db.commit()
     db.refresh(db_bid)
+
+    # /ws/bids/{plate_id}/ ga yangilanish yuborish
+    await manager.broadcast({
+        "type": "new_bid",
+        "bid": {
+            "id": db_bid.id,
+            "amount": db_bid.amount,
+            "user_id": db_bid.user_id,
+            "created_at": db_bid.created_at.isoformat()
+        },
+        "highest_bid": db_bid.amount
+    }, bid.plate_id)
+
+    # /ws/plates/ ga yangilangan plita ma’lumotlarini yuborish
+    await manager.broadcast({
+        "type": "plate_updated",
+        "plate": {
+            "id": plate.id,
+            "plate_number": plate.plate_number,
+            "description": plate.description,
+            "deadline": plate.deadline.isoformat(),
+            "is_active": plate.is_active,
+            "highest_bid": db_bid.amount
+        }
+    }, plate_id=None)
+
     return db_bid
 
 
